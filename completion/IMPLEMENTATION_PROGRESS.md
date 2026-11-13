@@ -1,0 +1,340 @@
+# Implementation Progress
+
+## Phase 1 — Baseline and tests (2026-11-01)
+
+Changed files
+- `backend/cart-service/src/test/resources/application.yml`, `backend/loyalty-service/src/test/resources/application.yml`
+  — `spring.kafka.producer.properties.max.block.ms: 500`. Without a broker each event send blocked 60 s; the cart suite
+  ran for >10 minutes before it was stopped. After the change: cart 7/7 and loyalty 8/8 pass in seconds.
+- `.github/workflows/ci-backend.yml` — matrix now includes accounting, analytics, cart, crm, error-stack, loyalty,
+  procurement, qa, stock (was 9 of 18 testable modules).
+- `.github/workflows/ci-frontend.yml` — builds all 15 apps (was 7); new `unit-tests` job runs `npm test` for
+  shared-library, mfe-order, mfe-product on Node 22 (`--experimental-strip-types` needs 22.6+; the build job stays on 20).
+  Both files parse as YAML (checked with the `yaml` package); they have not been run on GitHub.
+
+Commands run: see TEST_EXECUTION_REPORT.
+
+## Phase 2 — Security, identity, multi-tenancy (started)
+
+Changed files
+- `backend/api-gateway/.../security/TenantRoutePolicy.java` (new) — allow-list of routes a tenant-scoped token may reach.
+- `backend/api-gateway/.../security/JwtAuthenticationFilter.java` — (a) open endpoints matched exactly / by prefix /
+  per-service api-docs regex instead of `contains`; (b) tenant tokens checked against `TenantRoutePolicy` → 403.
+  (The Inventory & Procurement session edits other lines of this file concurrently: `/api/procurement/ucp/` and
+  `/api/inventory/ops/` gates. Both changes coexist; coordination note in the shared notes folder.)
+- `backend/api-gateway/src/test/.../GatewayTenantBoundaryTest.java` (new, 5 tests) and
+  `GatewayHeaderSanitizationTest.java` (new, 2 tests).
+- `docker-compose.yml` — 10 services now require `SERVICE_TO_SERVICE_TOKEN` (`:?` instead of the public default).
+- `.env.example` — documents `SERVICE_TO_SERVICE_TOKEN`.
+
+Explanation: see SECURITY_AUDIT S1–S3 and MULTI_TENANCY_AUDIT.
+
+## Phase 3 — Gateway / service authz (started)
+- `backend/stock-service/.../StockInternalController.java`, `StockController.java` — service token compared with
+  `MessageDigest.isEqual` (constant time).
+- `backend/stock-service/src/test/.../StockServiceIntegrationTest.java` — new test: internal endpoint refuses a missing or
+  near-miss token and accepts the exact one.
+
+## Phase 1 addendum
+- `backend/error-stack-service/.../ErrorRecordRepository.java`, `ErrorStackService.java` — hourly-trend query used `TO_CHAR(...,'YYYY-MM-DD HH24:00')` (Postgres-only literal); now `'YYYY-MM-DD HH24'` with `:00` appended in Java. Same keys on Postgres; the H2 test that errored now passes.
+- `backend/config-repo/cart-service-docker.yml`, `loyalty-service-docker.yml` — `max.block.ms: 5000` (was default 60 s). Not redeployed.
+
+## Results (real runs, details in TEST_EXECUTION_REPORT)
+- Backend: 368 tests across 18 modules, 0 failures, 0 errors (offline, H2, no Docker).
+- Frontend: 76 node tests pass; 15 apps type-check with 0 errors.
+- Not run: Postgres migrations, Kafka, live gateway, UI, load, DAST.
+
+## Unresolved defects
+KNOWN_ISSUES K1–K16.
+
+## Next phase
+1. Run the edited CI on GitHub (needs a push — not done; nothing committed).
+2. Phase 2/3 service-side slices: own JWT verification + `tenant_id` for accounting, then crm and analytics.
+3. Phase 5 Payment service design + first slice (webhook intake with signature check and idempotency).
+
+## Phase 2/3 slice — Accounting tenant scoping (2026-11-01)
+
+Changed files (accounting-service unless noted)
+- `pom.xml` — jjwt 0.11.5 (same as order-service).
+- `accounting/security/AccountingAuthenticationFilter.java` (new) — `/api/accounting/admin/**` now verifies the JWT itself.
+  Tenant tokens must be ACCOUNTING tokens (issuer, audience, jti, tenant claims) with a live grant (identity-service check);
+  platform tokens keep working and are pinned to the legacy tenant. The X-User-*/X-Tenant-ID headers the controllers read are
+  replaced with verified claims, so a request that bypasses the gateway cannot forge role, permission or tenant.
+- `AccountingJwtVerifier`, `AccountingAuthorizationClient`, `AccountingTenantContext`, `AccountingTenantResolver` (new).
+- `model/LedgerTransaction`, `RefundRequest`, `AccountingAuditLog` — `@TenantId` (Hibernate scopes queries and inserts).
+- `service/AccountingService.java` — by-id loads check the tenant (Hibernate does **not** apply `@TenantId` to `findById`;
+  the Postgres test proved tenant B could reverse tenant A's transaction before this fix).
+- `service/AdvancedAccountingService.java` — every SQL statement scoped by `tenant_id` (applied by a script that asserted
+  each match count). Also fixed a pre-existing bug: journal, invoice and draft lists failed on PostgreSQL whenever a filter
+  was empty (`? IS NULL` with an untyped null) — now `CAST(? AS …)`.
+- `service/SupplierPayablesService.java` (Inventory & Procurement session's file; minimal edit, they were told) —
+  `ON CONFLICT(tenant_id, code)` and tenant-scoped lookups, otherwise its upsert would fail after V19.
+- `db/migration/V19__tenant_scope_accounting.sql` (new) — `tenant_id NOT NULL DEFAULT legacy` on 12 tables; per-tenant
+  business keys (account code, entry number, idempotency keys, invoice number, period name); composite same-tenant foreign
+  keys (lines→entries/drafts/accounts, reversal, posted draft); tenant indexes.
+- Tests: `AccountingSecurityAndControllerTest` admin cases now send a platform token; new
+  `AccountingTenantIsolationPostgresTest` (5 tests, real Postgres + Flyway V1–V19, gated on `UCP_TEST_ACCOUNTING_POSTGRES_URL`
+  pointing at a `ucp_scratch_*` database); test `jwt.secret`.
+- api-gateway: `TenantRoutePolicy` allows `/api/accounting/admin/` for tenant tokens; test route + 1 new test.
+
+Commands and results
+- Scratch DB `ucp_scratch_accounting_v19`: V1–V18 applied with psql, constraint names listed and compared with the live
+  `accounting_db` (identical), V19 applied cleanly.
+- Scratch DB `ucp_scratch_accounting_copy`: `pg_dump accounting_db | psql` (live DB only read), V19 applied cleanly;
+  all 14 existing ledger rows mapped to the legacy tenant.
+- `mvnw -o -pl accounting-service test` with `UCP_TEST_ACCOUNTING_POSTGRES_URL=jdbc:postgresql://localhost:15432/ucp_scratch_accounting_test`:
+  **23 tests, 0 failures** (6 controller + 12 service on H2, 5 isolation on Postgres).
+- `mvnw -o -pl api-gateway test`: **38 tests, 0 failures**.
+
+Not done / limits
+- Deployed 2026-11-01: jar rebuilt (`mvnw -o -pl accounting-service package -DskipTests`), `docker compose up -d --build --no-deps accounting-service` with the stack's existing service token. Flyway applied V19 on the live `accounting_db` (14/14 ledger rows in the legacy tenant; new constraints present); container healthy. Probes: gateway `/api/accounting/admin/accounts` and `/dashboard` without token → 401; direct call to the service with forged `X-User-Role: ADMIN` and no token → refused (403, see K20). No authenticated live probe (no login credential available). The api-gateway container was not redeployed, so the new `/api/accounting/admin/` tenant allow-list entry is not live.
+- `ACCOUNTING` is `PLANNED` in `application_registry`, so user-service will not issue Accounting tenant tokens yet;
+  activating it needs a user-service migration (next free version after the sibling's V13) and is a product decision.
+- Customer endpoints (`/api/accounting/balance|ledger|…`) still trust `X-User-Id` and stay legacy-tenant; tenant tokens are
+  refused there by the gateway.
+- Controller permission checks are still coarse (`role contains ADMIN` or any `accounting:` permission); the gateway route map
+  enforces read/write/approve/reconcile/import/export per route.
+- An unknown ledger id still surfaces as an unhandled `IllegalArgumentException` (HTTP 500) — pre-existing.
+- The Postgres test does not run in CI (no Postgres service there yet).
+
+### api-gateway redeployed (2026-11-01 ~10:25)
+- `mvnw -o -pl api-gateway package` (38 tests, 0 failures), `docker compose up -d --build --no-deps api-gateway` with the stack's
+  existing service token.
+- Live probes against `localhost:8080`:
+  - No token: `/api/orders/admin/orders/swagger` and `/api/notifications/actuator` → 401; `POST /api/users/login` stays open (400 for an empty body).
+  - Test tokens were minted inside the gateway container for a random, non-existent tenant (5-minute expiry; the signing
+    secret never left the container). ECOMMERCE_ADMIN tenant token with `*`: `/api/orders`, `/api/users`, `/api/access/roles`,
+    `/api/accounting/balance`, `/api/products/admin/analytics/inventory`, `/api/crm/customers` → 403 from the gateway (empty
+    body, no content type); `/api/orders/admin/orders` → forwarded (JSON 403 from order-service's grant check).
+  - ACCOUNTING tenant token: `/api/accounting/admin/accounts` → forwarded (accounting-service request counter +3 for 3
+    probes; the service then refuses because the tenant has no grant); `/api/accounting/balance` → blocked at the gateway
+    (counter moved only by the metric reads/health checks).
+- A positive authenticated call (real tenant with an Accounting grant) is still not possible: `ACCOUNTING` is PLANNED.
+
+### Accounting application activated (2026-11-01 ~10:30)
+- `backend/user-service/src/main/resources/db/migration/V14__activate_accounting_application.sql` (new): `ACCOUNTING` → ACTIVE,
+  `required_permissions={accounting:read}`, metadata names the tenant-scoped API. Existing roles cover it (ACCOUNTANT, AUDITOR,
+  MANAGER, ADMIN from V4).
+- Verified on a `pg_dump` copy of the live `user_db` (scratch DB, dropped afterwards); `mvnw -o -pl user-service package`:
+  12 tests, 0 failures (the Testcontainers Postgres test still cannot reach Docker from Maven and does not run).
+- Redeployed user-service only (`--no-deps`); only V14 was newer than the running jar. Flyway: "now at version v14"; live
+  registry shows `ACCOUNTING|ACTIVE`.
+- Not verified: an end-to-end Accounting login. No tenant has an Accounting entitlement/grant and no test credentials exist;
+  creating them means writing a test tenant and user into the live `user_db`, which was not done.
+- Found: `ECOMMERCE_ADMIN` is still PLANNED live (KNOWN_ISSUES K21).
+
+### Live end-to-end Accounting verification with seeded test tenants (2026-11-01 ~10:40)
+Seed (dev only, reusable):
+- `scripts/dev-seed/accounting-test-users.env` — generated test credentials (git-ignored via new `.gitignore` rule
+  `scripts/dev-seed/*.env`; regenerate freely).
+- Users registered through the real `POST /api/users/register` (passwords hashed by the app): accountant A, auditor A,
+  accountant B (`@ucp-accounting.test`).
+- `scripts/dev-seed/accounting-test-tenants.sql` — idempotent: tenants `ucp-test-acct-a` / `ucp-test-acct-b`, ACCOUNTING
+  entitlements, memberships, grants, roles (ACCOUNTANT, AUDITOR, ACCOUNTANT), audit-log rows; removal block included.
+- `scripts/dev-seed/accounting-tenant-e2e.sh` — live check through the gateway; prints statuses/ids only.
+
+Defects found by the live run and fixed
+- `docker-compose.yml`: accounting-service had no `IDENTITY_SERVICE_URL`, so its grant check called `localhost:8081` inside its
+  own container and every tenant request was refused. Added `IDENTITY_SERVICE_URL=http://user-service:8081`. (The Postgres
+  integration test mocks the grant client, so it could not catch this.)
+- accounting `SecurityConfig`: `/error` is now permitted, so filter refusals keep their real status (401/403/503) instead of
+  all becoming 403 (K20 resolved).
+- Rebuilt with tests (23/23 incl. 5 on Postgres) and redeployed accounting-service. The first run right after the restart
+  still saw 503s from the grant check (transient start-up/DNS); a replay from the container returned 204 and the next full run passed.
+
+Live result: **21/21 checks pass** — application logins for all three users; cross-tenant login refused (403); both tenants
+create the same account codes and the same journal idempotency key and get separate journals (ids 1 and 2, stored with tenant
+A/B ids in `accounting_db`); B's journal list excludes A's; auditor can read but not post (403); accountant cannot approve
+(403); tenant token refused on customer accounting and CRM (403); forged `X-Tenant-ID` ignored.
+Caveat: "B cannot reverse A's journal" is refused by the gateway's `accounting:approve` rule before the service's tenant
+check; the service-level cross-tenant refusal is proven by `AccountingTenantIsolationPostgresTest`, not by this live run.
+
+Data left in the live databases (test data, removable with the SQL block in the seed file): 3 users, 2 tenants and their
+grants in `user_db`; in `accounting_db`, 4 accounts, 2 journals with 4 lines and their audit rows, all under the two test
+tenant ids.
+
+### E-commerce Admin application activated and verified live (2026-11-01 ~10:50)
+- `backend/user-service/src/main/resources/db/migration/V15__activate_ecommerce_admin_application.sql` (new): `ECOMMERCE_ADMIN`
+  → ACTIVE (metadata lists product-service and order-service tenant APIs). `required_permissions` is informational only (no
+  code reads it) and was left as is.
+- Verified on a `pg_dump` copy of the live `user_db`; `mvnw -o -pl user-service package`: 12 tests, 0 failures; redeployed
+  user-service only (V15 was the only change); Flyway "now at version v15"; live registry: ACCOUNTING and ECOMMERCE_ADMIN ACTIVE.
+- Dev seed extended: `scripts/dev-seed/ecommerce-admin-test-grants.sql` gives the two existing test accountants a read-only
+  ORDER_ANALYST E-commerce Admin grant in their own tenant (no new users).
+- `scripts/dev-seed/ecommerce-admin-e2e.sh` (live, through the gateway): **12/12 pass** — E-commerce Admin logins for both
+  tenants; auditor without a grant cannot log in; tenant A's order list and dashboard return 200 and the list is empty
+  (`totalElements: 0`) while the legacy tenant has 90 orders; legacy order #1 → 404 for tenant A; ORDER_ANALYST refused on
+  pricing admin (403); tenant token refused on legacy `/api/orders` (403); an E-commerce Admin token is refused by accounting
+  admin and an Accounting token by order admin (403).
+- Not verified live: write actions in the order/pricing/storefront consoles with tenant logins (no tenant has orders,
+  products or prices; the test grant is read-only). Those flows are covered by the module integration tests.
+
+### Phase 6 slice — tenant-aware checkout (2026-11-01 ~11:00)
+Changed files
+- product-service: `storefront/InternalStorefrontController.java` (new) — `GET /internal/storefronts/{slug}` (service token,
+  fails closed) returns tenant, store and type of an ACTIVE storefront; `SecurityConfig` permits the route (the controller checks
+  the token). Test: `InternalStorefrontControllerTest` (2).
+- order-service:
+  - `dto/CheckoutRequest.java` — optional `storefront` (public slug).
+  - `service/StorefrontClient.java` (new) — resolves the slug through product-service; unknown/malformed → 400, outage → 503.
+  - `service/OrderService.java` — with a storefront, the order gets that storefront's tenant, store and type (client `storeId`
+    and `orderType` ignored) and is always priced by that tenant's pricing, regardless of the deployment-wide pricing flag.
+    Pricing refuses products the tenant does not sell, so an order cannot include another tenant's products → 400 and no order.
+    A failure after redemption releases the promotions in that tenant. Without a storefront, legacy checkout is unchanged.
+  - `service/PricingClient.java` — tenant-explicit `redeem`/`reverse` overloads (legacy methods delegate with the configured tenant).
+  - `admin/OrderAdminService.java` — cancellation releases promotions in the order's own tenant (and also when the global
+    pricing flag is off, as long as the order has a promotion reference).
+  - `controller/OrderController.java` — **security fix**: the authenticated `X-User-Id` now always wins over a `userId` in the
+    request body (before, any shopper could place an order as another user).
+  - Tests: new `StorefrontCheckoutTest` (6: storefront tenant/store/pricing, restaurant type, foreign product refused, unknown
+    storefront, legacy unchanged, body userId cannot impersonate); `OrderPricingCheckoutTest` now verifies the tenant-explicit reverse.
+- frontend `mfe-order/src/pages/OrderPage.tsx` — **fake data removed**: a failed checkout used to show a randomly numbered
+  "PLACED" receipt and empty the cart; it now shows the error and keeps the cart.
+
+Results
+- `mvnw -o -pl order-service,product-service test`: order 99/99, product 77/77 (one first-run failure was my own test asserting
+  RECEIVED; with no stock-service in tests the restaurant order is PENDING_INVENTORY — assertion corrected).
+- mfe-order: `tsc` clean, 20/20 node tests, `vite build` ok (dist is volume-mounted, so it is live).
+- Redeployed product-service and order-service (only these changes were newer than the running containers).
+- Live (`scripts/dev-seed/storefront-checkout-e2e.sh`, test storefront `ucp-test-acct-a-shop` from `storefront-test.sql`):
+  shopper login; unknown storefront → 400; tenant A storefront refuses a legacy-tenant product → 400 "An item is not sold by this
+  storefront or cannot be priced."; malformed slug → 400; order count unchanged (90). Only refusal paths were run live, so no
+  order was created and no stock moved.
+
+Not done / limits
+- No storefront UI sends `storefront` yet: the shell/mfe-order checkout is the legacy single-store flow. Wiring the storefront
+  pages (Storefront Studio public site) to a cart and checkout is the next frontend slice.
+- A successful live storefront order was not placed (the test tenant has no products or prices; placing one would also move
+  stock in the shared legacy stock-service, which is not tenant-aware).
+- Customer accounts are still platform-wide (no per-tenant customers); stock deduction still uses the legacy stock-service;
+  `order-events` still carry no tenant, so notification/accounting consumers treat storefront orders as legacy.
+
+## Phase 0 — Baseline and checkpoint (2026-11-01, branch `feature/ucp-completion-modernization`)
+
+Tasks completed
+- Recorded git state. `main` at `faeea04a`, 15 commits ahead of `origin/main` (not pushed), untracked `info/` (a separate git repo, left unchanged).
+- Created checkpoint branch `backup/pre-modernization-faeea04a` at `faeea04a` and worked on `feature/ucp-completion-modernization` from it. Both are local.
+- Checked the tooling: Java 17.0.11, Node 24.5.0, Docker Engine 29.9.2 and Compose v5.6.1, with the daemon running. Earlier notes said no daemon was available; that is out of date.
+- Found a scratch Postgres (`ucp-test-pg`, PostgreSQL 15.18 on `127.0.0.1:55432`) and built service images. Read-only: nothing was written to it.
+- Inventoried backend modules, Flyway migrations, frontend workspaces, Compose services, Kubernetes resources, CI workflows and test annotations. Verified that `backend/legacy/` is not referenced by the POM, Compose or CI.
+- Wrote [docs/assessment/REPOSITORY_BASELINE.md](../assessment/REPOSITORY_BASELINE.md).
+
+Files changed
+- `docs/assessment/REPOSITORY_BASELINE.md` (new)
+- `docs/completion/IMPLEMENTATION_PROGRESS.md` (this entry)
+
+Tests executed in this phase
+- None new. Results from this session's earlier work are listed in REPOSITORY_BASELINE.md (product-service 83/83, shared-library 48/48, mfe-product 17/17, mfe-order 20/20, 16 typechecks).
+- The full backend suite was not rerun. The last full run (385 executed, 380 passed, 0 failed, 5 skipped) predates the outbox adoption, order tenant and storefront commits.
+
+Known issues found
+- The Postgres-gated accounting test needs a database named `ucp_scratch_*`. The databases in the scratch container do not match that pattern.
+- `backend/legacy/` (43 files) is unreferenced by the build.
+- Duplicate `AdminAnalyticsDashboard.tsx` in `mfe-analytics` and `mfe-order`.
+- Local Node (24.5) differs from the frontend image (node 20).
+- Several status documents still say "no Docker daemon".
+
+Not done in this phase
+- GitHub push: no approval given. Pushing the feature branch would also push the 15 unpushed `main` commits, so this needs an explicit decision.
+- The plan's documentation tree, cleanup report, security assessment, test results record and root README rewrite.
+
+Remaining phases: 1 to 9, none started.
+
+Next action
+- Phase 1 needs a decision on which environment to use. Option A: run the Postgres-gated tests against a new `ucp_scratch_phase1` database in the existing scratch container (creating a database there and no other change). Option B: skip that and begin the cleanup candidates listed in REPOSITORY_BASELINE.md.
+
+## Phase 1 — Postgres-gated tests (2026-11-01, partly done)
+
+Scope
+- Ran the three Postgres-gated test classes against real PostgreSQL 15 for the first time. Each module got its own scratch database in the existing `ucp-test-pg` container: `ucp_scratch_phase1_accounting`, `ucp_scratch_phase1_user`, `ucp_scratch_phase1_delivery`. One database per module keeps each Flyway history separate. The first plan used one database; this was changed for that reason.
+- The database password was read from the container's environment at run time and passed through environment variables. It was not written to any file. No other container or database was touched.
+
+Results
+- accounting-service `AccountingTenantIsolationPostgresTest`: 5 run, 0 failures, `BUILD SUCCESS`. Flyway `accounting_flyway_schema_history` reached V19.
+- delivery-service `DeliveryTenantIsolationPostgresIntegrationTest`: 6 run, 0 failures, `BUILD SUCCESS`. Flyway V1 and V2 applied.
+- user-service `TenantAccessPostgresIntegrationTest`: 1 run, 1 failure. Line 109 expected 204 and got 400. Cause: B-38 (the INVENTORY grant rule rejects `WAREHOUSE_OPERATOR`). The assertions after line 109 did not run, so that test is unverified.
+- Flyway on Postgres: user-service V1 to V16 applied, none failed.
+
+Defects found
+- B-38 (new, open): `WAREHOUSE_OPERATOR` cannot be granted the INVENTORY application. V13 added cross-module permissions to the role, and the rule in `TenantAccessService.grantApplication` requires INVENTORY roles to hold only `inventory:` permissions. Needs a policy decision. Not changed here.
+- K11 partly resolved: accounting V1 to V19, user V1 to V16 and delivery V1 to V2 apply cleanly on Postgres. Inventory V4 is still not run.
+
+Files changed
+- `docs/status/BUGS_AND_TECHNICAL_DEBT.md` (B-38 added)
+- `docs/completion/KNOWN_ISSUES.md` (K11 updated)
+- `docs/completion/IMPLEMENTATION_PROGRESS.md` (this entry)
+- No code changed.
+
+Run notes
+- The first attempt passed a comma-separated `-Dtest` list through `mvnw.cmd`; `cmd` split it and no tests ran. No database changed in that attempt. Each module now runs one class per invocation.
+
+Not done
+- The inventory Postgres path.
+- The rest of the user-service Postgres test, which depends on the B-38 decision.
+- A full backend rerun.
+
+Scratch databases left in `ucp-test-pg`: the three above. They hold test data only and can be dropped on request.
+
+Next action
+- Owner decides the B-38 policy. After that, the user-service test can be rerun to completion, and inventory's Postgres path can be run next.
+
+### Inventory Postgres path (2026-11-01)
+
+- Ran the inventory-service suite with `UCP_TEST_INVENTORY_POSTGRES_URL` pointing at a new scratch database, `ucp_scratch_phase1_inventory`, in `ucp-test-pg`. This supersedes the "inventory Postgres path" item under "Not done" above.
+- Result: 29 run, 0 failures, `BUILD SUCCESS`. The Postgres-backed classes are `InventoryServiceIntegrationTest` (9) and `OpsIntegrationTest` (11). The other classes use H2 and were unaffected. The outbox module's 10 tests ran first, because `-am` was needed (see below).
+- Flyway: inventory V1 to V5 applied on Postgres, all successful.
+- First attempt failed before any test ran: `-pl inventory-service` alone could not resolve `ucp-outbox`, which is a sibling module. `-am` fixes that.
+- Not done in this section: the user-service test (still blocked on B-38) and the Postgres path for stock, cart, loyalty and order.
+
+### Other services' migrations on Postgres (2026-11-01)
+
+- Stock, cart, loyalty and order have no Postgres test path, so no test ran against them. Their migration files were applied in numeric version order with `psql -v ON_ERROR_STOP=1` into four scratch databases: `ucp_scratch_phase1_stock`, `_cart`, `_loyalty`, `_order`.
+- Result: stock V1 to V4 (4 files), cart V1 to V2 (2), loyalty V1 to V2 (2), order V1 and V4 to V11 (8). All applied without error.
+- Limits: this is not a Flyway run, so `flyway_schema_history` was not written, and no entity validation or test ran. It shows the SQL applies, not that the services start.
+- Observation: order-service has no V2 or V3 file; the sequence goes from V1 to V4. Flyway accepts gaps, so this is not an error, but the reason is not recorded in the repository.
+
+### B-38 correction (2026-11-01)
+
+- An earlier note in this log said that allowing module-scoped permissions would let `WAREHOUSE_OPERATOR` through. That was wrong: the role also holds procurement permissions (`goods-receipt:manage`, `purchase-order:view`), so a module-scoped rule still refuses it.
+- Checked against the scratch database: no seeded role passes the INVENTORY rule today. The rule requires `inventory:read` and only `inventory:` permissions. Roles that have `inventory:read` also have non-inventory permissions. V13 roles hold `inventory:view` instead. Details are in BUGS_AND_TECHNICAL_DEBT B-38.
+- The owner's decision is whether a warehouse operator's Inventory access includes goods receipt and purchase-order view. Yes: widen the rule to the V13 vocabulary. No: trim the role in a new migration.
+
+### Full backend run with Postgres enabled (2026-11-01)
+
+- `mvnw -B -ntp -fae test` from `backend/`, with the four Postgres URLs pointing at fresh databases (`ucp_scratch_full_accounting`, `_user`, `_delivery`, `_inventory`) in `ucp-test-pg`.
+- Result: 427 run, 426 passed, 1 failed, 0 errors, 0 skipped. Earlier full runs skipped 5 tests; none are skipped now.
+- Modules: 18 of 19 succeed. user-service fails on the single B-38 assertion in `TenantAccessPostgresIntegrationTest` (line 109). The assertions after line 109 did not run, so that test's remaining checks are still unverified. Every other test in the run passed.
+- Postgres-gated classes in this run: accounting 5 (pass), delivery 6 (pass), inventory 9 and 11 in its two Postgres-enabled classes (pass), user-service 1 (fail, B-38). The inventory module total is 29, including its H2 classes. The outbox module's 10 tests are included in the 427.
+- Because the Postgres classes are included, this run covers both the Postgres and H2 paths in each module.
+
+### B-38 fixed by owner decision (2026-11-01, commit `f216d479`)
+
+- Decision: a warehouse operator's Inventory access includes goods receipt (`goods-receipt:manage`) and purchase-order view (`purchase-order:view`).
+- Change: `TenantAccessService.grantApplication`. An INVENTORY grant needs `inventory:view` or `inventory:read`, and may carry only inventory and warehouse permissions plus those two procurement permissions. Other permissions are still refused.
+- Tests: new `TenantAccessPostgresIntegrationTest.inventoryGrantAcceptsWarehouseOperatorAndRefusesRolesOutsideTheRuleInPostgres` (ADMIN, INVENTORY_MANAGER, INVENTORY_ANALYST and PROCUREMENT_MANAGER refused; WAREHOUSE_OPERATOR accepted). The existing tenant-access test now runs to its end. user-service: 19 run, 0 failed, against `ucp_scratch_b38_user`.
+- Still refused: INVENTORY_MANAGER and INVENTORY_ANALYST, which hold `supplier:view` (OPEN_ISSUES 1b, owner decision).
+- Not verified: procurement-service accepting `goods-receipt:manage` from an INVENTORY-scoped token. The app token now carries the permission; whether procurement honours it through the gateway was not tested.
+
+## Local deployment (2026-11-01)
+
+- Deployed a lean core of the platform to this machine with Docker Compose (project `ucp`, fresh volumes): infrastructure (Postgres, Redis, Zookeeper, Kafka), config and discovery servers, the API gateway, six backend services and six frontends. 19 containers, about 3.9 GiB of Docker's 7.62 GiB.
+- Verified: health, Eureka registration, Flyway from scratch on six databases (0 failed), Super Admin login (and a wrong-password 401), frontends over HTTP, catalog through the nginx proxy, a customer checkout that produced order 1 and a published `ORDER_CREATED` event on the `order-events` topic, and data surviving a Postgres restart.
+- Not verified: any browser flow, the stock effect of checkout (no reservation row appeared), notifications, payments, the nine undeployed services and nine other frontends.
+- Problems found: parallel frontend builds time out on `npm install`; the gateway's dependency list pulls in 10 services; eleven hard-coded `container_name` entries; Zipkin errors when observability is not started.
+- Details, commands and the stop/remove procedure: [DEPLOYMENT_REPORT.md](DEPLOYMENT_REPORT.md) and [../deployment/LOCAL_DEPLOYMENT.md](../deployment/LOCAL_DEPLOYMENT.md).
+- No code changed for the deployment. Secrets for it live in `scripts/dev-seed/deploy-local.env`, which is git-ignored; your `.env` was not modified.
+
+### Browser check of the local deployment and SF-01 (2026-11-01)
+
+- Built-in browser: the shell home page and the product catalog render with no console errors. The product remote loads from port 3001 and calls only same-origin `/api` paths.
+- SF-01 in the browser: `?storefront=local-demo` shows the storefront banner and 3 items; `?storefront=empty-shop` (a tenant with no products) shows 0 items; `?storefront=nope` returns 404 from the lookup, clears the stored slug and falls back to the default catalog.
+- SF-01 on the server, through the gateway: checkout with `local-demo` produced order 2 in the storefront's store; `empty-shop` and an unknown slug were refused with 400 and created no order. This is the first run of order-service calling product-service's internal storefront lookup over the network.
+- Test data added to the local deployment only: two `storefronts` rows (inserted with `psql`), a few throwaway customers, and orders 1 and 2. No repository file changed.
+- Not clicked through: sign-in, cart and checkout pages. The checkout checks used the API with a throwaway customer.
+
+### UI click-through finds two cart defects (2026-11-01)
+
+- Signed in through the UI as a throwaway customer and added a product on `?storefront=local-demo`; both worked.
+- B-39 (fixed, `353478dc`): `GET /api/cart` returned 500 on PostgreSQL for a user without a cart, because `getCart` and `validateCart` were read-only transactions that insert a cart. The 8 existing H2 tests passed; a new contract test fails on the old code and passes now (cart-service 9 tests). cart-service was rebuilt and recreated on the local deployment; both endpoints return 200.
+- B-40 (open, decision needed): the cart is not shared between micro-frontends. Each bundle has its own Redux store because `@ecommerce/shared-library` is not in the federation `shared` list, and the cart is not persisted, so the cart page and the checkout page never see items added in the catalog. The UI checkout cannot be completed in the deployed build.
+- Not changed for B-40: it touches the federation config of every app and needs a rebuild of the frontend images. Recommended fix: share `@ecommerce/shared-library` as a singleton.
